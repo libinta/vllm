@@ -8,7 +8,11 @@ from packaging import version
 from torch.nn import Module
 
 from vllm._ipex_ops import ipex_ops as ops
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.fused_moe_router import (
+    FusedMoERouter,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -22,12 +26,16 @@ from vllm.model_executor.layers.quantization.awq import AWQLinearMethod
 from vllm.model_executor.layers.quantization.fp8 import (
     Fp8Config,
     Fp8LinearMethod,
+    Fp8MoEMethod,
     Fp8OnlineMoEMethod,
 )
 from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
-from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    is_layer_skipped,
+    scaled_dequantize,
+)  
 from vllm.model_executor.utils import replace_parameter
-from vllm.platforms import current_platform
+from vllm.platforms import current_platform 
 
 MIN_IPEX_VERSION = "2.6.0"
 
@@ -299,10 +307,131 @@ class IPEXAWQLinearMethod(AWQLinearMethod):
         out = layer.ipex_qlinear(reshaped_x)
         return out.reshape(x.shape[:-1] + (layer.ipex_output_size,))
 
+class XPUFp8MoEMethodOffline(Fp8MoEMethod):
+    def __init__(self, quant_config: "Fp8Config", layer: torch.nn.Module):
+        super().__init__(quant_config, layer)
+        self.quant_config = quant_config
+        # Required attributes
+        self.weight_block_size = self.quant_config.weight_block_size
+        self.block_quant: bool = self.weight_block_size is not None
+        self.weight_scale_name = (
+            "weight_scale_inv" if self.block_quant else "weight_scale"
+        )
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        fp8_dtype = current_platform.fp8_dtype()
+        if not hasattr(layer, "w13_weight_scale"):
+            if hasattr(layer, "w13_weight_scale_inv"):
+                # Alias the block quant scale name to the expected name
+                replace_parameter(layer, "w13_weight_scale", layer.w13_weight_scale_inv)
+            else:
+                raise AttributeError("Missing w13_weight_scale attribute")
+
+        if not hasattr(layer, "w2_weight_scale"):
+            if hasattr(layer, "w2_weight_scale_inv"):
+                replace_parameter(layer, "w2_weight_scale", layer.w2_weight_scale_inv)
+            else:
+                raise AttributeError("Missing w2_weight_scale attribute")
+
+        w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
+        w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
+
+        # Re-initialize w13_scale because we directly quantize
+        # merged w13 weights and generate a single scaling factor.
+        w13_weight_scale = torch.nn.Parameter(torch.ones(
+            layer.local_num_experts,
+            dtype=torch.float32,
+            device=w13_weight.device,
+            ),
+            requires_grad=False,
+        )
+        for expert in range(layer.local_num_experts):
+            w13_in = layer.w13_weight.data[expert, :, :]
+            w2_in = layer.w2_weight.data[expert, :, :]
+
+            if w13_in.dtype != fp8_dtype:
+                # Use proper dequantization utility
+                w13_scale = layer.w13_weight_scale[expert] if hasattr(layer, 'w13_weight_scale') else  1.0
+                w2_scale = layer.w2_weight_scale[expert] if hasattr(layer, 'w2_weight_scale') else 1.0
+                w13_bf16 = scaled_dequantize(w13_in, w13_scale, group_shape=None, out_dtype=torch.bfloat16)
+                w2_bf16 = scaled_dequantize(w2_in, w2_scale, group_shape=None, out_dtype=torch.bfloat16)
+
+            w13_weight[expert, :, :], w13_weight_scale[expert] = ( ops.scaled_fp8_quant(w13_bf16))
+            w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (ops.scaled_fp8_quant(w2_bf16))
+        replace_parameter(layer, "w13_weight", w13_weight)
+        replace_parameter(layer, "w2_weight", w2_weight)
+        replace_parameter(layer, "w13_weight_scale", w13_weight_scale)
+
+        import intel_extension_for_pytorch as ipex
+
+        ep_rank_start = self.moe.ep_rank * self.moe.num_local_experts
+        layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
+            layer.w13_weight,
+            layer.w2_weight,
+            w1_scale_inv=layer.w13_weight_scale,
+            w2_scale_inv=layer.w2_weight_scale,
+            a1_scale_inv=layer.w13_input_scale,
+            a2_scale_inv=layer.w2_input_scale,
+            use_prepack=True,
+            experts_start_id=ep_rank_start,
+        )
+
+    @property
+    def is_monolithic(self) -> bool:
+        return True
+
+    def apply_monolithic(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        #print("DEBUG: Using monolithic XPU FP8 MoE path")
+        return layer.ipex_fusion(
+            x,
+            layer.use_grouped_topk,
+            layer.top_k,
+            router_logits,
+            layer.renormalize,
+            layer.topk_group,
+            layer.num_expert_group,
+            custom_routing_function=layer.custom_routing_function,
+        )
+
+    def get_fused_moe_quant_config(self, layer: torch.nn.Module):
+        return None
 
 class XPUFp8LinearMethod(Fp8LinearMethod):
     def __init__(self, quant_config: Fp8Config):
         super().__init__(quant_config)
+        
+    def convert_e4m3_to_e5m2(self,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Convert FP8 E4M3 weights/scales to E5M2 on XPU."""
+        if weight.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"Expected e4m3fn, got {weight.dtype}")
+         # Use vLLM's robust dequantization with proper group broadcasting
+        weight_dequant = scaled_dequantize(
+            weight,
+            weight_scale,
+            group_shape=None,  # Let it infer from scale shape
+            out_dtype=torch.bfloat16
+        )
+        # Reshape to 2D for quantization (merge all but last dimension)
+        original_shape = weight_dequant.shape
+        weight_dequant_2d = weight_dequant.view(-1, weight_dequant.shape[-1])
+
+        # Requantize to E5M2 using XPU's preferred dtype
+        weight_e5m2_2d, scale_e5m2 = ops.scaled_fp8_quant(weight_dequant_2d, scale=None)
+
+        # Reshape back to original dimensions
+        weight_e5m2 = weight_e5m2_2d.view(original_shape)
+        return weight_e5m2, scale_e5m2, input_scale
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
@@ -314,13 +443,25 @@ class XPUFp8LinearMethod(Fp8LinearMethod):
             replace_parameter(layer, "weight", qweight.data)
             replace_parameter(layer, "weight_scale", weight_scale.data)
             layer.input_scale = None
+        else:
+            if not hasattr(layer, "weight_scale"):
+               if hasattr(layer, "weight_scale_inv"):
+                   replace_parameter(layer, "weight_scale", layer.weight_scale_inv)
+                   if layer.weight.dtype == torch.float8_e4m3fn and layer.weight.dtype != current_platform.fp8_dtype():
+                       weight_e5m2, scale_e5m2, _ = self.convert_e4m3_to_e5m2(
+                           layer.weight, layer.weight_scale, getattr(layer, "input_scale", None))
+                       replace_parameter(layer, "weight", weight_e5m2)
+                       replace_parameter(layer, "weight_scale", scale_e5m2)
+               else:
+                    raise AttributeError("Missing weight_scale attribute")
+            layer.input_scale = None
 
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor: 
         weight = layer.weight.data
         weight_scale = layer.weight_scale.data
         output = torch.ops.torch_ipex.fp8_gemm_w8a16(
@@ -381,13 +522,10 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
     ) -> FusedMoEQuantConfig | None:
         return None
 
-    @property
-    def is_monolithic(self) -> bool:
-        return True
-
-    def apply_monolithic(
+    def apply(
         self,
         layer: torch.nn.Module,
+        router: FusedMoERouter,
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:

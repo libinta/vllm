@@ -186,6 +186,7 @@ class Fp8Config(QuantizationConfig):
         from vllm.model_executor.layers.quantization.ipex_quant import (
             XPUFp8LinearMethod,
             XPUFp8MoEMethod,
+            XPUFp8MoEMethodOffline,
         )
 
         fp8_config = Fp8Config(
@@ -211,7 +212,10 @@ class Fp8Config(QuantizationConfig):
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
 
-            return XPUFp8MoEMethod(fp8_config, layer)
+             if self.is_checkpoint_fp8_serialized:
+                return XPUFp8MoEMethodOffline(fp8_config, layer)
+            else:
+                return XPUFp8MoEMethod(fp8_config, layer)
         elif isinstance(layer, Attention):
             return Fp8KVCacheMethod(self)
         return None
