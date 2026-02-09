@@ -33,9 +33,9 @@ from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
     scaled_dequantize,
-)  
+)
 from vllm.model_executor.utils import replace_parameter
-from vllm.platforms import current_platform 
+from vllm.platforms import current_platform
 
 MIN_IPEX_VERSION = "2.6.0"
 
@@ -358,7 +358,7 @@ class XPUFp8MoEMethodOffline(Fp8MoEMethod):
                 w13_bf16 = scaled_dequantize(w13_in, w13_scale, group_shape=None, out_dtype=torch.bfloat16)
                 w2_bf16 = scaled_dequantize(w2_in, w2_scale, group_shape=None, out_dtype=torch.bfloat16)
 
-            w13_weight[expert, :, :], w13_weight_scale[expert] = ( ops.scaled_fp8_quant(w13_bf16))
+            w13_weight[expert, :, :], w13_weight_scale[expert] = (ops.scaled_fp8_quant(w13_bf16))
             w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (ops.scaled_fp8_quant(w2_bf16))
         replace_parameter(layer, "w13_weight", w13_weight)
         replace_parameter(layer, "w2_weight", w2_weight)
@@ -461,14 +461,13 @@ class XPUFp8LinearMethod(Fp8LinearMethod):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
-    ) -> torch.Tensor: 
+    ) -> torch.Tensor:
         weight = layer.weight.data
         weight_scale = layer.weight_scale.data
         output = torch.ops.torch_ipex.fp8_gemm_w8a16(
             x, weight, True, weight_scale, bias
         )
         return output
-
 
 class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
     def __init__(self, quant_config: Fp8Config, layer: torch.nn.Module):
@@ -522,10 +521,13 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
     ) -> FusedMoEQuantConfig | None:
         return None
 
+    @property
+    def is_monolithic(self) -> bool:
+        return True
+
     def apply(
         self,
         layer: torch.nn.Module,
-        router: FusedMoERouter,
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
