@@ -656,8 +656,14 @@ def get_cuda_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tensor:
     Get a CUDA view of a CPU tensor using Unified Virtual Addressing (UVA).
     """
     assert cpu_tensor.is_pinned(), "CPU tensor must be pinned"
-    return torch.ops._C.get_cuda_view_from_cpu_tensor(cpu_tensor)
+    #return torch.ops._C.get_cuda_view_from_cpu_tensor(cpu_tensor)
+    from vllm.platforms import current_platform
 
+    if current_platform.is_xpu():
+         xpu_tensor = cpu_tensor.to('xpu', non_blocking=True)
+         return xpu_tensor
+        #return torch.ops._C.get_xpu_view_from_cpu_tensor(cpu_tensor)
+    return torch.ops._C.get_cuda_view_from_cpu_tensor(cpu_tensor)
 
 # Helper function used in testing.
 def _is_torch_equal_or_newer(torch_version: str, target: str) -> bool:

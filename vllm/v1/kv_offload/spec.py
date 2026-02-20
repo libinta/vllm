@@ -39,7 +39,7 @@ class OffloadingSpec(ABC):
         self.offloaded_block_size = int(
             self.extra_config.get("block_size", self.gpu_block_size)
         )
-
+        logger.info(f'self.gpu_block_size {self.gpu_block_size} self.offloaded_block_size {self.offloaded_block_size}')
         assert self.offloaded_block_size % self.gpu_block_size == 0
 
     @abstractmethod

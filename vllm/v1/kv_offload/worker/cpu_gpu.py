@@ -6,7 +6,13 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from vllm import _custom_ops as ops
+#from vllm import _custom_ops as ops
+from vllm.platforms import current_platform
+
+if current_platform.is_cuda_alike():
+    from vllm import _custom_ops as ops
+elif current_platform.is_xpu():
+    from vllm._ipex_ops import ipex_ops as ops
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionBackend
@@ -169,10 +175,10 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 self.dst_tensors,
                 self.block_size_in_bytes,
             ):
+                    #block_size_in_bytes,
                 ops.swap_blocks(
                     src_tensor,
                     dst_tensor,
-                    block_size_in_bytes,
                     src_to_dst_tensor,
                 )
             end_event.record(stream)
