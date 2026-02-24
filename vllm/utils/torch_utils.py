@@ -660,9 +660,10 @@ def get_cuda_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tensor:
     from vllm.platforms import current_platform
 
     if current_platform.is_xpu():
-         xpu_tensor = cpu_tensor.to('xpu', non_blocking=True)
-         return xpu_tensor
-        #return torch.ops._C.get_xpu_view_from_cpu_tensor(cpu_tensor)
+        #xpu_tensor = cpu_tensor.to('xpu', non_blocking=True)
+        #return xpu_tensor
+        return torch.ops._C.get_xpu_view_from_cpu_tensor(cpu_tensor)
+
     return torch.ops._C.get_cuda_view_from_cpu_tensor(cpu_tensor)
 
 # Helper function used in testing.

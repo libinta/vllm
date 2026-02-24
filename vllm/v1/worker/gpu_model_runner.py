@@ -5782,7 +5782,6 @@ class GPUModelRunner(
 
         # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype
-        logger.info(f"{kv_cache_config} kernel_block_sizes {kernel_block_sizes}")
         if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
             kv_caches, cross_layers_kv_cache, attn_backend = (
                 self.allocate_uniform_kv_caches(

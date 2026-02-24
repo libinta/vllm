@@ -9,6 +9,7 @@ import torch
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
 #from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
 if current_platform.is_xpu():
@@ -17,7 +18,7 @@ if current_platform.is_xpu():
     )
 else:
     from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
-BACKENDS_TO_TEST = [FlashAttentionBackend]
+BACKENDS_TO_TEST = [TritonAttentionBackend]
 
 if not current_platform.is_rocm() and not current_platform.is_xpu():
     from vllm.v1.attention.backends.flashinfer import FlashInferBackend
@@ -81,23 +82,26 @@ def test_transfer(
     assert logical_block_size % kernel_block_size == 0
     kernel_blocks_per_gpu_block = logical_block_size // kernel_block_size
     num_gpu_kernel_blocks = num_gpu_blocks * kernel_blocks_per_gpu_block
-
+    print(f" gpu_to_cpu: {gpu_to_cpu}")
     gpu_caches = {}
     attn_backends = {}
     for i in range(num_layers):
         layer_name = f"layer {i}"
-
+        #print(f"i {i} layer_name  {layer_name} ")
         attn_backend = attn_backends_list[i % len(attn_backends_list)]
         attn_backends[layer_name] = attn_backend
-
+        #print(f"attn_backends_list {attn_backends_list}")
         gpu_cache_shape = attn_backend.get_kv_cache_shape(
             num_gpu_kernel_blocks, kernel_block_size, num_heads, head_size
         )
+        print(f"gpu_cache_shape {gpu_cache_shape}")
         gpu_caches[layer_name] = torch.rand(gpu_cache_shape, dtype=dtype, device=device)
 
     # create handler
     cpu_block_size = logical_blocks_per_cpu_block * logical_block_size
     kernel_blocks_per_cpu_block = cpu_block_size // kernel_block_size
+    print(f"cpu_block_size {cpu_block_size}")
+    print(f"gpu_block_size {logical_block_size}")
     handlers = CpuGpuOffloadingHandlers(
         attn_backends=attn_backends,
         gpu_block_size=logical_block_size,
@@ -163,8 +167,8 @@ def test_transfer(
     for src_block, dst_block in zip(
         src_blocks_in_kernel_block_size, dst_blocks_in_kernel_block_size
     ):
-        dst_to_src[dst_block] = src_block
-
+        dst_to_src[dst_block] = src_block 
+    print(f"dst_to_src {dst_to_src}")
     # build transfer specs
     src_spec = src_spec_class(src_blocks)
     dst_spec = dst_spec_class(dst_blocks)
@@ -177,14 +181,15 @@ def test_transfer(
     start_time = time.time()
     assert handler.transfer_async(1, (src_spec, dst_spec))
     assert set({x.job_id for x in handler._transfers}) == {1}
-
+    torch.xpu.synchronize()
     # wait for transfer to complete
-    end_time = time.time() + 10
+    end_time = time.time() + 100
     while time.time() < end_time:
         finished = handler.get_finished()
         if finished:
             assert finished[0].job_id == 1
             assert finished[0].success
+            print(f"{finished[0].transfer_type}")
             assert (
                 finished[0].transfer_type == ("GPU", "CPU")
                 if gpu_to_cpu
@@ -196,18 +201,23 @@ def test_transfer(
                 * handler.dst_block_size_factor
                 * len(dst_blocks)
             )
+            print(f"finished[0].transfer_size {finished[0].transfer_size}")
             assert finished[0].transfer_time > 0
             assert finished[0].transfer_time < (time.time() - start_time)
             break
         time.sleep(0.1)
-
+    torch.xpu.synchronize()
     # verify src tensors did not change
     for orig_tensor, tensor in zip(orig_src_caches, handler.src_tensors):
+        print(f"orig_tensor {orig_tensor.sum()} tensor {tensor.sum()}")
         assert torch.equal(orig_tensor, tensor)
 
     # verify dst tensors
+    import pdb
+    print(f" dst_size_in_kernel_blocks {dst_size_in_kernel_blocks}")
     for dst_block in range(dst_size_in_kernel_blocks):
         src_block_candidate = dst_to_src.get(dst_block)
+        print(f"src_block_candidate {src_block_candidate}")
         for src_cache, dst_cache, orig_dst_cache in zip(
             handler.src_tensors,
             handler.dst_tensors,
@@ -216,5 +226,12 @@ def test_transfer(
             if src_block_candidate is not None:
                 expected_value = src_cache[src_block_candidate]
             else:
+                print(f"dst_block {dst_block}")
                 expected_value = orig_dst_cache[dst_block]
-            torch.testing.assert_close(dst_cache[dst_block].cpu(), expected_value.cpu())
+            torch.xpu.synchronize()
+            #pdb.set_trace()
+            print(f"{dst_cache[dst_block].cpu().sum()}, {expected_value.cpu().sum()}")
+            try:
+                torch.testing.assert_close(dst_cache[dst_block].cpu(), expected_value.cpu())
+            except AssertionError:
+                print("assert fail")

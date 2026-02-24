@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import deque
 from dataclasses import dataclass
-
+from typing import Literal
 import numpy as np
 import torch
-
+import time
 #from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 
@@ -34,6 +34,44 @@ class Transfer:
     end_event: torch.Event
     num_bytes: int
 
+from typing import Literal
+
+def swap_blocks(
+    src_kv_caches: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    dst_kv_caches: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    src_to_dsts: torch.Tensor,
+    direction: Literal["h2d", "d2h"],
+    block_size: int = 128,
+) -> None:
+    """Copy kv blocks between different buffers."""
+
+    src_to_dsts = src_to_dsts.transpose(0, 1)
+    src_block_ids = src_to_dsts[0]
+    dst_block_ids = src_to_dsts[1]
+    assert len(src_block_ids) == len(dst_block_ids)
+
+    src_device = src_kv_caches[0].device
+    dst_device = dst_kv_caches[0].device
+
+    src_block_ids = src_block_ids.to(src_device)
+    dst_block_ids = dst_block_ids.to(dst_device)
+
+    start = time.perf_counter()
+    target_device = dst_device.type
+
+    key_cache = src_kv_caches[0]
+    value_cache = src_kv_caches[1]
+
+    dst_kv_caches[0].index_put_((dst_block_ids, ), key_cache.index_select(0, src_block_ids).to(target_device))
+    dst_kv_caches[1].index_put_((dst_block_ids, ), value_cache.index_select(0, src_block_ids).to(target_device))
+
+    torch.xpu.synchronize()
+
+    logger.debug(
+        "swap_blocks: copy takes %s|direction=%s|pid=%s|block_size=%s|"
+        "src_block_ids_len=%s|dst_block_ids_len=%s|src_kv_caches_len=%s|",
+        time.perf_counter() - start, direction, os.getpid(), block_size, len(src_block_ids), len(dst_block_ids),
+        len(src_kv_caches))
 
 def expand_block_ids(
     block_ids: np.ndarray,
@@ -111,7 +149,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self.total_block_size_in_bytes = sum(self.block_size_in_bytes)
 
         assert len(src_tensors) > 0
-        self.gpu_to_cpu: bool = self.src_tensors[0].is_cuda
+        if current_platform.is_xpu():
+            self.gpu_to_cpu: bool = self.src_tensors[0].is_xpu
+            #logger.info(f"self.src_tensors[0].is_xpu {self.src_tensors[0].is_xpu}")
+        else:
+            self.gpu_to_cpu: bool = self.src_tensors[0].is_cuda
         self.transfer_type = ("GPU", "CPU") if self.gpu_to_cpu else ("CPU", "GPU")
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
@@ -159,7 +201,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             if self._event_pool
             else torch.Event(enable_timing=True)
         )
-
+        #logger.info(f"self.gpu_to_cpu {self.gpu_to_cpu}")
         if self.gpu_to_cpu:
             # wait for model computation to finish before offloading
             stream.wait_stream(torch.cuda.current_stream())
@@ -176,6 +218,10 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 self.block_size_in_bytes,
             ):
                     #block_size_in_bytes,
+                logger.info(f"src_tensor {src_tensor.shape}, {self.src_tensors[0].device.type}")
+                logger.info(f"dst_tensor {dst_tensor.shape}")
+                logger.info(f"src_to_dst_tensor {src_to_dst_tensor.shape}")
+                #swap_blocks(
                 ops.swap_blocks(
                     src_tensor,
                     dst_tensor,
@@ -211,7 +257,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 transfer_time=transfer_time,
                 transfer_type=self.transfer_type,
             )
-
+            logger.info(f"result {result}")
             results.append(result)
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
@@ -248,9 +294,11 @@ class CpuGpuOffloadingHandlers:
             test_shape = attn_backend.get_kv_cache_shape(
                 num_blocks=1234, block_size=16, num_kv_heads=8, head_size=256
             )
-
+            #test_shape = (2, test_shape[0] // 128, 128, test_shape[1], test_shape[2])
             has_layers_dim = False
             split_k_and_v = False
+            logger.info(f"gpu_shape {gpu_shape}")
+            logger.info(f"test_shape {test_shape}")
             if len(gpu_shape) != len(test_shape):
                 # cross-layers tensor
                 # shape is (num_blocks, ...)
@@ -269,12 +317,15 @@ class CpuGpuOffloadingHandlers:
                 kv_cache_stride_order = attn_backend.get_kv_cache_stride_order(
                     include_num_layers_dimension=has_layers_dim
                 )
+                logger.info(f"kv_cache_stride_order {kv_cache_stride_order}")
                 assert len(kv_cache_stride_order) == len(gpu_shape)
             except (AttributeError, NotImplementedError):
                 kv_cache_stride_order = tuple(range(len(gpu_shape)))
 
             # permute test_shape according to stride_order
             test_shape = tuple(test_shape[i] for i in kv_cache_stride_order)
+
+            logger.info(f"test_shape after permute {test_shape}")
 
             # find block_size (16) dimension index
             block_size_idx = test_shape.index(16)
@@ -290,7 +341,7 @@ class CpuGpuOffloadingHandlers:
         cpu_block_size_factor = cpu_block_size // kernel_block_size
         gpu_block_size_factor = gpu_block_size // kernel_block_size
         num_cpu_kernel_blocks = num_cpu_blocks * cpu_block_size_factor
-
+        logger.info(f"cpu_block_size {cpu_block_size} gpu_block_size {gpu_block_size} kernel_block_size {kernel_block_size} num_cpu_blocks {num_cpu_blocks} cpu_block_size_factor {cpu_block_size_factor}")
         # allocate cpu tensors
         pin_memory = is_pin_memory_available()
         logger.info("Allocating %d CPU tensors...", len(parsed_gpu_tensors))
@@ -300,7 +351,7 @@ class CpuGpuOffloadingHandlers:
             cpu_shape = list(gpu_tensor.shape)
             cpu_shape[1 if split_k_and_v else 0] = num_cpu_kernel_blocks
 
-            logger.debug("Allocating CPU tensor of shape %r", cpu_shape)
+            logger.info("Allocating CPU tensor of shape %r", cpu_shape)
             cpu_tensor = torch.zeros(
                 cpu_shape,
                 dtype=gpu_tensor.dtype,

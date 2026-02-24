@@ -93,7 +93,7 @@ class CPUOffloadingSpec(OffloadingSpec):
         if not self._handlers:
             if not current_platform.is_cuda_alike() and not current_platform.is_xpu():
                 raise Exception(
-                    "CPU Offloading is currently only supported on CUDA-alike GPUs"
+                    "CPU Offloading is currently only supported on CUDA-alike GPUs and Intel XPUs"
                 )
 
             if current_platform.is_xpu():
@@ -108,7 +108,6 @@ class CPUOffloadingSpec(OffloadingSpec):
                 )
             else:
                 from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
-
                 self._handlers = CpuGpuOffloadingHandlers(
                     attn_backends=attn_backends,
                     gpu_block_size=self.gpu_block_size,

@@ -134,12 +134,13 @@ def _accuracy_test(llm: LLM, subscriber: MockSubscriber):
         != 0
     ):
         prompt = ". " + prompt
-
+    # llm.reset_prefix_cache()
     assert subscriber.get_new_cpu_stored_events()
 
     test_count = 100
     success_count = 0
     for i in range(test_count):
+        print(llm.generate(prompt, sampling_params, use_tqdm=False)[0].outputs[0].text)
         if (
             llm.generate(prompt, sampling_params, use_tqdm=False)[0].outputs[0].text
             == " five"
@@ -181,7 +182,7 @@ def test_cpu_offloading(cpu_block_size: int, attn_backend: str) -> None:
 
     llm = LLM(
         model="meta-llama/Llama-3.2-1B-Instruct",
-        gpu_memory_utilization=0.5,
+        gpu_memory_utilization=0.8,
         kv_events_config=kv_events_config,
         kv_transfer_config=kv_transfer_config,
         attention_config={"backend": attn_backend},
