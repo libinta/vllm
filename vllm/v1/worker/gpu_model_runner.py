@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -5226,6 +5227,13 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
+        if os.getenv("VLLM_DISABLE_PROFILE_RUN", "0") == "1":
+            logger.info_once(
+                "Skipping GPU profile_run because "
+                "VLLM_DISABLE_PROFILE_RUN=1"
+            )
+            return
+
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config

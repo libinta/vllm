@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 
@@ -418,6 +419,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        if os.getenv("VLLM_DISABLE_PROFILE_RUN", "0") == "1":
+            logger.info_once(
+                "Skipping GPU profile_run because "
+                "VLLM_DISABLE_PROFILE_RUN=1"
+            )
+            return
+
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True
         )
