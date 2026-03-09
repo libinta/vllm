@@ -157,16 +157,20 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         3. Output projection
         """
         num_tokens = hidden_states.size(0)
-
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+
+
+
+        print(f"libin debug gdn_attention_core 0 {hidden_states.shape=} {mixed_qkvz.shape=} {num_tokens=}")
         qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
         z_size = self.value_dim // self.tp_size
         mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
         z = z.reshape(z.size(0), -1, self.head_v_dim)
         ba, _ = self.in_proj_ba(hidden_states)
+        print(f"libin debug gdn_attention_core 1 {qkv_size=} {mixed_qkv.shape=}{ba.shape=}")
         b, a = ba.chunk(2, dim=-1)
 
         b = b.contiguous()
@@ -182,7 +186,8 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-
+            
+        print(f"libin debug gdn_attention_core {mixed_qkv.shape=} {b.shape=} {a.shape=} {core_attn_out.shape=}{self.prefix=}")
         torch.ops.vllm.gdn_attention_core(
             mixed_qkv,
             b,
@@ -727,7 +732,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
 
         if intermediate_tensors is not None:
             inputs_embeds = None
-
         hidden_states = self.language_model.model(
             input_ids=input_ids,
             positions=positions,

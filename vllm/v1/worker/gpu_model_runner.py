@@ -3605,6 +3605,7 @@ class GPUModelRunner(
                 scheduler_output, clear_metadata=clear_kv_metadata
             ) as kv_connector_output,
         ):
+            logger.info(f"libin debug model forward input_ids: {input_ids.shape=}")
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,

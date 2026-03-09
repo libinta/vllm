@@ -342,5 +342,6 @@ class CustomOp(nn.Module):
             # We call the 'decorator' function immediately with the class.
             return decorator(_decorated_op_cls)
         else:
+            print(f"libin debug {_decorated_op_cls=} {type=}")
             # Handle other unexpected cases if necessary
             raise TypeError("Decorator can only be applied to classes.")

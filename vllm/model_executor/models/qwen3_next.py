@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
@@ -147,6 +149,592 @@ def fi_chunk_gated_delta_rule(
     )
     # Unsqueeze back to 4D (1, L, H, D) to match fla output format
     return output.unsqueeze(0), final_state
+
+
+def _local_materialize_seq_ranges(
+    cu_seqlens: torch.Tensor,
+    total_tokens: int,
+) -> list[tuple[int, int]]:
+    """Convert cu_seqlens to safe [bos, eos) ranges on CPU."""
+    try:
+        cu_cpu = cu_seqlens.to(dtype=torch.int64, device="cpu")
+    except RuntimeError as exc:
+        logger.warning(
+            "[Qwen3Next local chunk] Failed to materialize cu_seqlens on CPU "
+            "(%s). Falling back to a single contiguous range [0, %d).",
+            exc,
+            total_tokens,
+        )
+        return [(0, total_tokens)]
+
+    cu_list = cu_cpu.tolist()
+    ranges: list[tuple[int, int]] = []
+    for i in range(max(0, len(cu_list) - 1)):
+        bos_raw = int(cu_list[i])
+        eos_raw = int(cu_list[i + 1])
+        bos = min(max(bos_raw, 0), total_tokens)
+        eos = min(max(eos_raw, 0), total_tokens)
+        if eos < bos:
+            eos = bos
+        ranges.append((bos, eos))
+    return ranges
+
+
+def _local_l2norm_last_dim(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return x / torch.sqrt(torch.sum(x * x, dim=-1, keepdim=True) + eps)
+
+
+def _local_normalize_activation(activation: bool | str | None) -> str | None:
+    if isinstance(activation, bool):
+        return "silu" if activation else None
+    if activation is None:
+        return None
+    activation = activation.lower()
+    if activation not in {"silu", "swish"}:
+        raise ValueError(f"Unsupported activation '{activation}'.")
+    return activation
+
+
+def _local_apply_activation(output: torch.Tensor,
+                            activation: str | None) -> torch.Tensor:
+    if activation in {"silu", "swish"}:
+        return F.silu(output)
+    return output
+
+
+def _local_ensure_query_start_loc(query_start_loc: torch.Tensor) -> torch.Tensor:
+    if query_start_loc is None:
+        raise ValueError("'query_start_loc' must be provided for local causal conv.")
+    if query_start_loc.dim() != 1:
+        raise ValueError("'query_start_loc' must be 1-D.")
+    return query_start_loc.to(dtype=torch.int64)
+
+
+def _local_make_depthwise_weight(weight: torch.Tensor) -> torch.Tensor:
+    dim, width = weight.shape
+    return weight.contiguous().view(dim, 1, width)
+
+
+def _local_conv_state_layout(
+    conv_states: torch.Tensor,
+    dim: int,
+    state_len: int,
+) -> str:
+    """Infer conv-state layout for one cache line.
+
+    Supported layouts:
+    - [num_cache, dim, state_len]
+    - [num_cache, state_len, dim]
+    """
+    if conv_states.dim() != 3:
+        raise ValueError("'conv_states' must be a 3-D tensor.")
+    s1, s2 = int(conv_states.shape[1]), int(conv_states.shape[2])
+    if s1 == dim and s2 >= state_len:
+        return "dim_state"
+    if s2 == dim and s1 >= state_len:
+        return "state_dim"
+    raise ValueError(
+        "Unsupported conv_states layout for local causal conv: "
+        f"shape={tuple(conv_states.shape)}, dim={dim}, state_len={state_len}."
+    )
+
+
+def _local_flatten_inputs_for_update(
+    x: torch.Tensor,
+    query_start_loc: torch.Tensor | None,
+    dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Flatten update input to [dim, cu_seqlen] and track transpose restore."""
+    if query_start_loc is None:
+        if x.dim() == 2:
+            x_3d = x.unsqueeze(-1)
+            squeeze_last = True
+        elif x.dim() == 3:
+            x_3d = x
+            squeeze_last = False
+        else:
+            raise ValueError("When 'query_start_loc' is None, 'x' must be 2-D or 3-D.")
+        if x_3d.size(1) != dim:
+            raise ValueError("Dimension mismatch between 'x' and 'weight'.")
+        batch, _, seqlen = x_3d.shape
+        flat = x_3d.permute(1, 0, 2).contiguous().view(dim, batch * seqlen)
+        qsl = torch.arange(
+            0,
+            (batch + 1) * seqlen,
+            seqlen,
+            device=x.device,
+            dtype=torch.int64,
+        )
+        return flat, qsl, squeeze_last
+
+    if x.dim() != 2:
+        raise ValueError("Expected 2-D 'x' when 'query_start_loc' is provided.")
+    if x.size(0) == dim:
+        qsl = _local_ensure_query_start_loc(query_start_loc)
+        return x, qsl, False
+    if x.size(1) == dim:
+        qsl = _local_ensure_query_start_loc(query_start_loc)
+        return x.transpose(0, 1).contiguous(), qsl, True
+    raise ValueError("Could not infer how to flatten 'x' for update path.")
+
+
+def local_causal_conv1d_fn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    block_idx_first_scheduled_token: torch.Tensor | None = None,
+    block_idx_last_scheduled_token: torch.Tensor | None = None,
+    initial_state_idx: torch.Tensor | None = None,
+    num_computed_tokens: torch.Tensor | None = None,
+    block_size_to_align: int = 0,
+    metadata=None,
+    validate_data: bool = False,
+    is_prompt: bool = True,
+):
+    if any(ptr is not None for ptr in (
+            block_idx_first_scheduled_token,
+            block_idx_last_scheduled_token,
+            initial_state_idx,
+            num_computed_tokens,
+    )):
+        raise NotImplementedError("Prefix caching metadata is not supported in local causal conv.")
+
+    del block_size_to_align, metadata, is_prompt, validate_data
+    activation = _local_normalize_activation(activation)
+    original_dtype = x.dtype
+    work_dtype = conv_states.dtype if conv_states is not None else x.dtype
+    x_work = x.to(work_dtype)
+    weight_work = weight.to(work_dtype)
+    bias_work = bias.to(work_dtype) if bias is not None else None
+
+    assert conv_states is not None
+    if conv_states.device != x_work.device:
+        raise ValueError("'conv_states' must be on the same device as 'x'.")
+
+    qsl = _local_ensure_query_start_loc(query_start_loc)
+    qsl_list = qsl.to(dtype=torch.int64, device="cpu").tolist()
+    padded_batch = max(0, len(qsl_list) - 1)
+
+    dim, _ = x_work.shape
+    _, width = weight_work.shape
+    state_len = max(width - 1, 0)
+    weight_dw = _local_make_depthwise_weight(weight_work)
+    state_layout = _local_conv_state_layout(conv_states, dim, state_len)
+
+    if cache_indices is None:
+        batch_cache_idx = torch.arange(padded_batch,
+                                       device=x_work.device,
+                                       dtype=torch.long)
+    else:
+        batch_cache_idx = (
+            cache_indices.to(x_work.device)
+            if cache_indices.device != x_work.device else cache_indices
+        )
+    batch_cache_idx = batch_cache_idx.to(dtype=torch.long)
+
+    has_init_list: list[bool]
+    if has_initial_state is None:
+        has_init_list = [False] * padded_batch
+    else:
+        has_init_list = (
+            has_initial_state.to(dtype=torch.bool, device="cpu")
+            .reshape(-1)
+            .tolist()
+        )
+        if len(has_init_list) < padded_batch:
+            has_init_list.extend([False] * (padded_batch - len(has_init_list)))
+
+    out = torch.zeros_like(x_work)
+    for seq_id in range(padded_batch):
+        bos = int(qsl_list[seq_id])
+        eos = int(qsl_list[seq_id + 1])
+        if eos < bos:
+            eos = bos
+
+        cache_idx = batch_cache_idx[seq_id:seq_id + 1]
+        seq_x = x_work[:, bos:eos]
+
+        if state_len > 0:
+            if has_init_list[seq_id]:
+                cache_line = conv_states.index_select(0, cache_idx)[0]
+                if state_layout == "dim_state":
+                    init_state = cache_line[:, -state_len:]
+                else:
+                    init_state = cache_line[-state_len:, :].transpose(0, 1)
+            else:
+                init_state = torch.zeros(
+                    dim,
+                    state_len,
+                    device=x_work.device,
+                    dtype=work_dtype,
+                )
+            seq_input = torch.cat([init_state, seq_x], dim=1)
+        else:
+            seq_input = seq_x
+
+        seq_out = F.conv1d(
+            seq_input.unsqueeze(0),
+            weight_dw,
+            bias=bias_work,
+            groups=dim,
+        )
+        seq_out = _local_apply_activation(seq_out, activation).squeeze(0)
+        out[:, bos:eos] = seq_out
+
+        if state_len > 0:
+            new_state = seq_input[:, -state_len:]
+            with torch.no_grad():
+                #import remote_pdb; remote_pdb.set_trace()  # --- IGNORE ---
+                if state_layout == "dim_state":
+                    conv_states[cache_idx, :, -state_len:] = new_state.unsqueeze(0)
+                else:
+                    conv_states[cache_idx, -state_len:, :] = (
+                        new_state.transpose(-1, -2).unsqueeze(0)
+                    )
+                print(f"libin debug conv {cache_idx=}{bos=} {eos=} {new_state=} {seq_out=}")
+    return out.to(original_dtype)
+
+
+def local_causal_conv1d_fn_update(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    block_idx_first_scheduled_token: torch.Tensor | None = None,
+    block_idx_last_scheduled_token: torch.Tensor | None = None,
+    initial_state_idx: torch.Tensor | None = None,
+    num_computed_tokens: torch.Tensor | None = None,
+    block_size_to_align: int = 0,
+    metadata=None,
+    validate_data: bool = False,
+    is_prompt: bool = True,
+):
+    if any(ptr is not None for ptr in (
+            block_idx_first_scheduled_token,
+            block_idx_last_scheduled_token,
+            initial_state_idx,
+            num_computed_tokens,
+    )):
+        raise NotImplementedError("Prefix caching metadata is not supported in local causal conv.")
+
+    del metadata, validate_data, is_prompt, has_initial_state, block_size_to_align
+     # --- IGNORE ---
+    activation = _local_normalize_activation(activation)
+    original_dtype = x.dtype
+    work_dtype = conv_states.dtype if conv_states is not None else x.dtype
+    x_work = x.to(work_dtype)
+    weight_work = weight.to(work_dtype)
+    bias_work = bias.to(work_dtype) if bias is not None else None
+
+    assert conv_states is not None
+    if conv_states.device != x_work.device:
+        raise ValueError("'conv_states' must be on the same device as 'x'.")
+
+    qsl = _local_ensure_query_start_loc(query_start_loc)
+    padded_batch = max(0, int(qsl.numel()) - 1)
+
+    if x_work.dim() == 2:
+        x_work = x_work.unsqueeze(0)
+        squeeze_batch = True
+    elif x_work.dim() == 3:
+        squeeze_batch = False
+    else:
+        raise ValueError("local_causal_conv1d_fn_update expects x to be 2-D or 3-D.")
+
+    if x_work.shape[0] != padded_batch:
+        if x_work.shape[0] == 1 and padded_batch > 1:
+            x_work = x_work.expand(padded_batch, -1, -1)
+            squeeze_batch = False
+        else:
+            raise ValueError(
+                "Batch mismatch in local_causal_conv1d_fn_update: "
+                f"x batch={x_work.shape[0]}, qsl batch={padded_batch}."
+            )
+
+    _, dim, _ = x_work.shape
+    _, width = weight_work.shape
+    state_len = max(width - 1, 0)
+    weight_dw = _local_make_depthwise_weight(weight_work)
+    state_layout = _local_conv_state_layout(conv_states, dim, state_len)
+
+    if cache_indices is None:
+        batch_cache_idx = torch.arange(padded_batch,
+                                       device=x_work.device,
+                                       dtype=torch.long)
+    else:
+        batch_cache_idx = (
+            cache_indices.to(x_work.device)
+            if cache_indices.device != x_work.device else cache_indices
+        )
+    batch_cache_idx = batch_cache_idx.to(dtype=torch.long)
+
+    if state_len > 0:
+        if state_layout == "dim_state":
+            init_state = conv_states[batch_cache_idx, :, -state_len:]
+        else:
+            init_state = conv_states[batch_cache_idx, -state_len:, :].transpose(-1, -2)
+    else:
+        init_state = torch.zeros(
+            (padded_batch, dim, 0),
+            device=x_work.device,
+            dtype=work_dtype,
+        )
+
+    seq_input = torch.cat([init_state, x_work], dim=2)
+    new_state = seq_input[:, :, -state_len:] if state_len > 0 else None
+
+    seq_out = F.conv1d(seq_input, weight_dw, bias=bias_work, groups=dim)
+    seq_out = _local_apply_activation(seq_out, activation)
+
+    if state_len > 0 and new_state is not None:
+        with torch.no_grad():
+            #import remote_pdb; remote_pdb.set_trace()  # --- IGNORE ---
+            if state_layout == "dim_state":
+                conv_states[batch_cache_idx, :, -state_len:] = new_state
+            else:
+                conv_states[batch_cache_idx, -state_len:, :] = new_state.transpose(-1, -2)
+    #import remote_pdb; remote_pdb.set_trace() 
+    if squeeze_batch:
+        return seq_out.squeeze(0).to(original_dtype)
+    return seq_out.to(original_dtype)
+
+
+def local_causal_conv1d_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: bool | str | None = None,
+    conv_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    max_query_len: int = -1,
+    pad_slot_id: int = -1,
+    block_idx_last_scheduled_token: torch.Tensor | None = None,
+    initial_state_idx: torch.Tensor | None = None,
+    validate_data: bool = False,
+):
+    if num_accepted_tokens is not None:
+        raise NotImplementedError(
+            "Speculative decoding updates are not supported in local causal conv."
+        )
+    if block_idx_last_scheduled_token is not None or initial_state_idx is not None:
+        raise NotImplementedError(
+            "Prefix caching metadata is not supported in local causal conv."
+        )
+    if max_query_len not in (-1, None):
+        raise NotImplementedError("'max_query_len' is not used in local causal conv.")
+
+    del pad_slot_id
+
+    activation = _local_normalize_activation(activation)
+    dim = weight.size(0)
+
+    flat_x, qsl, transposed_input = _local_flatten_inputs_for_update(
+        x,
+        query_start_loc,
+        dim,
+    )
+
+    result = local_causal_conv1d_fn_update(
+        flat_x,
+        weight,
+        bias,
+        conv_state,
+        qsl,
+        cache_indices=conv_state_indices,
+        has_initial_state=None,
+        activation=activation,
+        metadata=None,
+        validate_data=validate_data,
+        is_prompt=False,
+    )
+
+    if transposed_input:
+        return result.transpose(0, 1).contiguous()
+    return result
+
+
+def local_chunk_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
+):
+    """Local PyTorch chunk rule matching hpu_chunk_gated_delta_rule semantics."""
+    B, T, H, Kdim = q.shape
+    _, _, HV, Vdim = v.shape
+    device = q.device
+    chunk_size = 64
+    if cu_seqlens is not None:
+        if B != 1:
+            raise ValueError("When cu_seqlens is used, expected batch size B=1.")
+        seq_ranges = _local_materialize_seq_ranges(cu_seqlens, B * T)
+        num_seqs = len(seq_ranges)
+    else:
+        num_seqs = B
+        seq_ranges = [(i * T, (i + 1) * T) for i in range(B)]
+
+    # Match upstream grouped-value semantics.
+    if H != HV:
+        if HV % H == 0:
+            repeat = HV // H
+            q = q.repeat_interleave(repeat, dim=2)
+            k = k.repeat_interleave(repeat, dim=2)
+            H = HV
+        else:
+            raise ValueError(
+                "Unsupported head mapping in local_chunk_gated_delta_rule: "
+                f"q/k heads={H}, value heads={HV}. Expected HV % H == 0."
+            )
+
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    else:
+        assert scale > 0, "scale must be positive"
+
+    if use_qk_l2norm_in_kernel:
+        q = _local_l2norm_last_dim(q.to(torch.float32))
+        k = _local_l2norm_last_dim(k.to(torch.float32))
+
+    qf = q.reshape(-1, H, Kdim).to(torch.float32)
+    kf = k.reshape(-1, H, Kdim).to(torch.float32)
+    vf = v.reshape(-1, HV, Vdim).to(torch.float32)
+    gf = g.reshape(-1, HV).to(torch.float32)
+    bf = beta.reshape(-1, HV).to(torch.float32)
+
+    g_cumsum = torch.empty_like(gf)
+    for bos, eos in seq_ranges:
+        for cs in range(bos, eos, chunk_size):
+            ce = min(cs + chunk_size, eos)
+            g_cumsum[cs:ce] = torch.cumsum(gf[cs:ce], dim=0)
+
+    if initial_state is None:
+        init_state = torch.zeros(
+            (num_seqs, H, Vdim, Kdim),
+            dtype=torch.float32,
+            device=device,
+        )
+    else:
+        if initial_state.shape[0] != num_seqs:
+            raise ValueError(
+                "The number of initial states is expected to equal the number "
+                f"of input sequences ({num_seqs}), got {initial_state.shape[0]}."
+            )
+        init_state = initial_state.to(torch.float32)
+
+    out = torch.empty((qf.shape[0], H, Vdim), dtype=torch.float32, device=device)
+    final_state = torch.empty_like(init_state) if output_final_state else None
+
+    eye_cache: dict[int, torch.Tensor] = {}
+    for seq_id, (bos, eos) in enumerate(seq_ranges):
+        if eos <= bos:
+            if final_state is not None:
+                final_state[seq_id] = init_state[seq_id]
+            continue
+
+        state = init_state[seq_id].clone()  # [H, V, K]
+
+        for cs in range(bos, eos, chunk_size):
+            ce = min(cs + chunk_size, eos)
+            tc = ce - cs
+
+            q_chunk = qf[cs:ce]          # [Tc, H, K]
+            k_chunk = kf[cs:ce]          # [Tc, H, K]
+            v_chunk = vf[cs:ce]          # [Tc, H, V]
+            g_chunk = g_cumsum[cs:ce]    # [Tc, H]
+            beta_chunk = bf[cs:ce]       # [Tc, H]
+
+            A_solve = torch.empty((H, tc, tc), dtype=torch.float32, device=device)
+            for h in range(H):
+                kh = k_chunk[:, h, :]  # [Tc, K]
+                bh = beta_chunk[:, h]  # [Tc]
+                gh = g_chunk[:, h]     # [Tc]
+                dot = kh @ kh.transpose(0, 1)
+                coeff = bh[:, None] * torch.exp(gh[:, None] - gh[None, :])
+                a_lower = torch.tril(dot * coeff, diagonal=-1)
+                if tc not in eye_cache:
+                    eye_cache[tc] = torch.eye(tc, dtype=torch.float32, device=device)
+                lmat = eye_cache[tc] + a_lower
+                A_solve[h] = torch.linalg.solve(
+                    lmat,
+                    eye_cache[tc],
+                )
+
+            u_chunk = torch.empty((tc, H, Vdim), dtype=torch.float32, device=device)
+            w_chunk = torch.empty((tc, H, Kdim), dtype=torch.float32, device=device)
+            for h in range(H):
+                rhs_u = v_chunk[:, h, :] * beta_chunk[:, h:h + 1]
+                rhs_w = (
+                    k_chunk[:, h, :]
+                    * (beta_chunk[:, h] * torch.exp(g_chunk[:, h]))[:, None]
+                )
+                u_chunk[:, h, :] = A_solve[h] @ rhs_u
+                w_chunk[:, h, :] = A_solve[h] @ rhs_w
+
+            v_new_chunk = torch.empty((tc, H, Vdim), dtype=torch.float32, device=device)
+            h_start = state.clone()
+            for h in range(H):
+                state_h = h_start[h]  # [V, K]
+                proj = w_chunk[:, h, :] @ state_h.transpose(0, 1)
+                # Match upstream chunk_delta_h: v_new saved for chunk_o is
+                # the unnormalized residual before applying g_last-g_t.
+                val_raw = u_chunk[:, h, :] - proj
+                v_new_chunk[:, h, :] = val_raw
+
+                g_last = g_chunk[-1, h]
+                # Only the recurrent state update uses the within-chunk g
+                # normalization; chunk_o consumes val_raw.
+                val_state = val_raw * torch.exp(g_last - g_chunk[:, h])[:, None]
+                state_h = state_h * torch.exp(g_last)
+
+                state_h = state_h + val_state.transpose(0, 1) @ k_chunk[:, h, :]
+                state[h] = state_h
+
+            for h in range(H):
+                qh = q_chunk[:, h, :]     # [Tc, K]
+                kh = k_chunk[:, h, :]     # [Tc, K]
+                vh = v_new_chunk[:, h, :] # [Tc, V]
+                hs = h_start[h]           # [V, K]
+                gh = g_chunk[:, h]        # [Tc]
+
+                base = qh @ hs.transpose(0, 1)  # [Tc, V]
+                # Match upstream chunk_o: recurrent base is weighted by exp(g_t).
+                base = base * torch.exp(gh)[:, None]
+                attn = qh @ kh.transpose(0, 1)  # [Tc, Tc]
+                attn = attn * torch.exp(gh[:, None] - gh[None, :])
+                attn = torch.tril(attn)
+                out[cs:ce, h, :] = (base + attn @ vh) * scale
+
+        if final_state is not None:
+            final_state[seq_id] = state
+
+    out = out.to(q.dtype)
+    if cu_seqlens is not None:
+        out = out.unsqueeze(0)
+    else:
+        out = out.view(B, T, H, Vdim)
+
+    if final_state is None:
+        return out, None
+    if initial_state is not None:
+        final_state = final_state.to(initial_state.dtype)
+    return out, final_state
 
 
 @CustomOp.register("chunk_gated_delta_rule")
@@ -477,6 +1065,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
 
         compilation_config = get_current_vllm_config().compilation_config
+  
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
@@ -579,7 +1168,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         3. Output projection
         """
         num_tokens = hidden_states.size(0)
-
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
@@ -640,9 +1228,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         if attn_metadata is None:
             # V1 profile run
             return
-
         assert isinstance(attn_metadata, dict)
+
+
         attn_metadata = attn_metadata[self.prefix]
+
         assert isinstance(attn_metadata, GDNAttentionMetadata)
         has_initial_state = attn_metadata.has_initial_state
         spec_query_start_loc = attn_metadata.spec_query_start_loc
@@ -666,6 +1256,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
+        use_local_causal_conv = (
+            os.getenv("VLLM_QWEN3NEXT_USE_LOCAL_CAUSAL_CONV", "0") == "1"
+        )
+        conv_fn = local_causal_conv1d_fn if use_local_causal_conv else causal_conv1d_fn
+        conv_update = (
+            local_causal_conv1d_update
+            if use_local_causal_conv else causal_conv1d_update
+        )
 
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
@@ -680,7 +1278,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            mixed_qkv_spec = causal_conv1d_update(
+            mixed_qkv_spec = conv_update(
                 mixed_qkv_spec,
                 conv_state,
                 conv_weights,
@@ -700,7 +1298,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
-            mixed_qkv_non_spec = causal_conv1d_fn(
+
+            mixed_qkv_non_spec = conv_fn(
                 mixed_qkv_non_spec_T,
                 conv_weights,
                 self.conv1d.bias,
@@ -712,7 +1311,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 metadata=attn_metadata,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
-            mixed_qkv_non_spec = causal_conv1d_update(
+            mixed_qkv_non_spec = conv_update(
                 mixed_qkv_non_spec,
                 conv_state,
                 conv_weights,
@@ -774,20 +1373,94 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         if attn_metadata.num_prefills > 0:
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=non_spec_query_start_loc,
-                use_qk_l2norm_in_kernel=True,
+            use_local_chunk_rule = (
+                os.getenv("VLLM_QWEN3NEXT_USE_LOCAL_CHUNK_RULE", "0") == "1"
             )
+            if use_local_chunk_rule:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    local_chunk_gated_delta_rule(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g=g_non_spec,
+                        beta=beta_non_spec,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
+                debug_compare_local = (
+                    os.getenv("VLLM_QWEN3NEXT_DEBUG_COMPARE_LOCAL_CHUNK", "0")
+                    == "1"
+                )
+                if debug_compare_local:
+                    native_out, native_state = self.chunk_gated_delta_rule(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g=g_non_spec,
+                        beta=beta_non_spec,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                    out_diff = (core_attn_out_non_spec - native_out).abs().amax()
+                    state_diff = (last_recurrent_state - native_state).abs().amax()
+                    logger.warning_once(
+                        "[Qwen3Next local chunk] debug compare enabled: "
+                        "max|out_local-out_native|=%s, "
+                        "max|state_local-state_native|=%s",
+                        out_diff,
+                        state_diff,
+                    )
+                    # Use a conservative parity threshold in fp16/bf16 runs.
+                    if out_diff > 3e-2 or state_diff > 3e-2:
+                        logger.warning_once(
+                            "[Qwen3Next local chunk] Difference vs native chunk "
+                            "exceeds threshold; using native results."
+                        )
+                        core_attn_out_non_spec, last_recurrent_state = (
+                            native_out,
+                            native_state,
+                        )
+                # If local fallback produces invalid or degenerate activations,
+                # retry with the native kernel path to keep generation healthy.
+                local_invalid = not torch.isfinite(core_attn_out_non_spec).all()
+                local_degenerate = core_attn_out_non_spec.abs().amax() <= 1e-8
+                if local_invalid or local_degenerate:
+                    logger.warning_once(
+                        "[Qwen3Next local chunk] Non-finite or near-zero output "
+                        "detected; falling back to native chunk rule."
+                    )
+                    core_attn_out_non_spec, last_recurrent_state = (
+                        self.chunk_gated_delta_rule(
+                            q=query_non_spec,
+                            k=key_non_spec,
+                            v=value_non_spec,
+                            g=g_non_spec,
+                            beta=beta_non_spec,
+                            initial_state=initial_state,
+                            output_final_state=True,
+                            cu_seqlens=non_spec_query_start_loc,
+                            use_qk_l2norm_in_kernel=True,
+                        )
+                    )
+            else:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    self.chunk_gated_delta_rule(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g=g_non_spec,
+                        beta=beta_non_spec,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
@@ -826,6 +1499,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+        print(f"libin debug linear attention {core_attn_out=}")
 
 
 class Qwen3NextAttention(nn.Module):
@@ -913,6 +1587,10 @@ class Qwen3NextAttention(nn.Module):
         output: torch.Tensor,
         hidden_states: torch.Tensor,
     ):
+        print(f"libin debug full attention {hidden_states.shape=} {hidden_states=}")
+        #if (hidden_states.shape[0] == 29 and hidden_states.device == 'cuda') or  \
+        #   (hidden_states.shape[1] == 2048 and hidden_states.device == 'hpu'):
+        #    import remote_pdb;remote_pdb.set_trace()
         qkv, _ = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
@@ -943,6 +1621,7 @@ class Qwen3NextAttention(nn.Module):
             attn_output = attn_output * gate
 
         output[:], _ = self.o_proj(attn_output)
+        print(f"libin debug full attention {output.shape=} {output=}")
 
 
 class Qwen3NextDecoderLayer(nn.Module):
