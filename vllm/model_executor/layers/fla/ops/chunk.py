@@ -7,6 +7,7 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
+import os
 import warnings
 
 import torch
@@ -20,6 +21,29 @@ from .solve_tril import solve_tril
 from .utils import SUPPRESS_LEVEL, input_guard
 from .wy_fast import recompute_w_u_fwd
 
+_VLLM_Q35_TC_OP = os.getenv("VLLM_Q35_TC_OP", "0") == "1"
+
+def _flatten_bt(x: torch.Tensor) -> torch.Tensor:
+    # [B,T,...] -> [T_total,...]
+    if x.ndim >= 2:
+        return x.reshape(-1, *x.shape[2:])
+    return x
+
+
+def _make_chunk_offsets(cu_seqlens: torch.Tensor, BT: int, device: torch.device):
+    if cu_seqlens.dtype not in (torch.int32, torch.int64):
+        cu_seqlens = cu_seqlens.to(torch.int64)
+    N = int(cu_seqlens.numel() - 1)
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)  # [N]
+    chunks_per_seq = (seqlens + (BT - 1)) // BT                   # [N]
+    chunk_offsets = torch.empty((N,), device=device, dtype=torch.int64)
+    if N > 0:
+        chunk_offsets[0] = 0
+        if N > 1:
+            chunk_offsets[1:] = torch.cumsum(chunks_per_seq[:-1], dim=0)
+    total_chunks = int(chunks_per_seq.sum().item())
+    return chunk_offsets, total_chunks
+
 
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
@@ -32,7 +56,9 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
 ):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+    BT = 64
+    # 1) same precompute as before
+    g = chunk_local_cumsum(g, chunk_size=BT, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
         k=k, beta=beta, g=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
@@ -46,28 +72,122 @@ def chunk_gated_delta_rule_fwd(
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
     )
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
-        k=k,
-        w=w,
-        u=u,
-        g=g,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-    )
-    o = chunk_fwd_o(
-        q=q,
-        k=k,
-        v=v_new,
-        h=h,
-        g=g,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-    )
-    if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
-    elif SUPPRESS_LEVEL >= 3:
-        return g, o, A, final_state, w, h, v_new
+    if _VLLM_Q35_TC_OP:
+        # 2) run ONLY torch H-stage
+        B, T, Hg, Kd = k.shape
+        _, _, H, Vd = u.shape
+        device = k.device
+        IS_VARLEN = cu_seqlens is not None
+
+        # token-major inputs for torch H kernel
+        k_tm = _flatten_bt(k)   # [T_total, Hg, K]
+        w_tm = _flatten_bt(w)   # [T_total, H,  K]
+        v_tm = _flatten_bt(u)   # [T_total, H,  V]
+        g_tm = _flatten_bt(g)   # [T_total, H]
+        T_total = int(k_tm.shape[0])
+
+        # chunk layout + buffers
+        if IS_VARLEN:
+            # op convention: varlen expects B == 1 and inputs already flattened into T_total
+            if B != 1:
+                raise ValueError(f"varlen path expects B=1, got B={B}")
+            chunk_offsets, total_chunks = _make_chunk_offsets(cu_seqlens, BT, device)
+            T_fixed = 0
+            # IMPORTANT: chunk_fwd_o expects h in 4D for varlen (matches typical triton wrapper)
+            h_shape = (total_chunks, H, Vd, Kd)
+        else:
+            NT = (T + BT - 1) // BT
+            total_chunks = B * NT
+            chunk_offsets = None
+            T_fixed = T
+            # non-varlen: chunk_fwd_o expects h in 5D [B, NT, H, V, K]
+            h_shape = (total_chunks, H, Vd, Kd)
+
+        h_dtype = k.dtype  
+        h_torch = torch.empty(h_shape, device=device, dtype=h_dtype)
+        v_new_torch = torch.empty((T_total, H, Vd), device=device, dtype=u.dtype)
+
+        ht_torch = None
+        if output_final_state:
+            ht_torch = torch.empty((B, H, Vd, Kd), device=device,
+                                dtype=h_dtype)
+
+        _, _, ht_out = chunk_gated_delta_rule_h_kernel_torch(
+            k=k_tm,
+            v=v_tm,
+            w=w_tm,
+            g=g_tm,
+            gk=None,
+            h=h_torch,
+            h0=initial_state,
+            ht=ht_torch,
+            cu_seqlens=cu_seqlens if IS_VARLEN else None,
+            chunk_offsets=chunk_offsets if IS_VARLEN else None,
+            T=T_fixed,
+            BT=BT,
+            H=H,
+            Hg=Hg,
+            K=Kd,
+            V=Vd,
+            USE_G=True,
+            USE_GK=False,
+            USE_INITIAL_STATE=(initial_state is not None),
+            STORE_FINAL_STATE=bool(output_final_state),
+            SAVE_NEW_VALUE=True,
+            IS_VARLEN=bool(IS_VARLEN),
+            v_new=v_new_torch,
+        )
+
+        # 3) reshape torch outputs into what chunk_fwd_o expects
+        if IS_VARLEN:
+            # v_new: [T_total,H,V] -> [1,T_total,H,V]
+            v_new_use = v_new_torch.view(1, T_total, H, Vd)
+            # h: keep 4D [total_chunks,H,V,K]
+            h_use = h_torch
+        else:
+            NT = (T + BT - 1) // BT
+            v_new_use = v_new_torch.view(B, T, H, Vd)          # [B,T,H,V]
+            h_use = h_torch.view(B, NT, H, Vd, Kd)             # [B,NT,H,V,K]
+
+        final_state_use = ht_out if output_final_state else None
+
+        # 4) finish O-stage using torch-produced v_new/h
+        o = chunk_fwd_o(
+            q=q,
+            k=k,
+            v=v_new_use,
+            h=h_use,
+            g=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+        )
+        if SUPPRESS_LEVEL < 3:
+            return g, o, A, final_state_use, None, None, None
+        else:
+            return g, o, A, final_state_use, w, h_use, v_new_use
+    else:
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+        )
+        o = chunk_fwd_o(
+            q=q,
+            k=k,
+            v=v_new,
+            h=h,
+            g=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+        )
+        if SUPPRESS_LEVEL < 3:
+            return g, o, A, final_state, None, None, None
+        elif SUPPRESS_LEVEL >= 3:
+            return g, o, A, final_state, w, h, v_new
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
@@ -106,6 +226,193 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         return o.to(q.dtype), final_state
 
+def chunk_gated_delta_rule_h_kernel_torch(
+    *,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    g: torch.Tensor | None,
+    gk: torch.Tensor | None,
+    h: torch.Tensor,
+    h0: torch.Tensor | None,
+    ht: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    T: int,
+    BT: int,
+    H: int,
+    Hg: int,
+    K: int,
+    V: int,
+    USE_G: bool,
+    USE_GK: bool,
+    USE_INITIAL_STATE: bool,
+    STORE_FINAL_STATE: bool,
+    SAVE_NEW_VALUE: bool,
+    IS_VARLEN: bool,
+    v_new: torch.Tensor | None = None,
+):
+    # ---- flatten [B,T,...] -> [T_total,...] if needed
+    if k.dim() == 4:
+        k = k.reshape(-1, k.shape[2], k.shape[3])  # [T_total,Hg,K]
+    if v.dim() == 4:
+        v = v.reshape(-1, v.shape[2], v.shape[3])  # [T_total,H,V]
+    if w.dim() == 4:
+        w = w.reshape(-1, w.shape[2], w.shape[3])  # [T_total,H,K]
+    if USE_G and g is not None and g.dim() == 3:
+        g = g.reshape(-1, g.shape[2])              # [T_total,H]
+    if USE_GK and gk is not None and gk.dim() == 4:
+        gk = gk.reshape(-1, gk.shape[2], gk.shape[3])  # [T_total,H,K]
+
+    device = v.device
+    T_total = v.shape[0]
+
+    assert v.shape == (T_total, H, V), (v.shape, T_total, H, V)
+    assert w.shape == (T_total, H, K), (w.shape, T_total, H, K)
+    assert k.shape == (T_total, Hg, K), (k.shape, T_total, Hg, K)
+    if USE_G:
+        assert g is not None and g.shape == (T_total, H), (None if g is None else g.shape)
+    if USE_GK:
+        assert gk is not None and gk.shape == (T_total, H, K), (None if gk is None else gk.shape)
+    if SAVE_NEW_VALUE:
+        assert v_new is not None and v_new.shape == (T_total, H, V)
+
+    # Infer N
+    # -----------------------------
+    # Infer N + per-sequence helpers
+    # -----------------------------
+    if IS_VARLEN:
+        assert cu_seqlens is not None and chunk_offsets is not None
+
+        if cu_seqlens.dtype not in (torch.int32, torch.int64):
+            cu_seqlens = cu_seqlens.to(torch.int64)
+        if chunk_offsets.dtype not in (torch.int32, torch.int64):
+            chunk_offsets = chunk_offsets.to(torch.int64)
+
+        N = int(cu_seqlens.numel() - 1)
+
+        def _seq_bounds(n: int):
+            bos = int(cu_seqlens[n].item())
+            eos = int(cu_seqlens[n + 1].item())
+            Tn = eos - bos
+            NT = (Tn + BT - 1) // BT
+            boh = int(chunk_offsets[n].item())
+            return bos, eos, Tn, NT, boh
+
+    else:
+        assert T > 0
+        N = int(T_total // T)
+        assert N * T == T_total
+
+        def _seq_bounds(n: int):
+            bos = n * T
+            eos = bos + T
+            Tn = T
+            NT = (Tn + BT - 1) // BT
+            boh = n * NT
+            return bos, eos, Tn, NT, boh
+
+
+    # -----------------------------
+    # state helpers
+    # -----------------------------
+    def _get_state(buf, n: int, ih: int):
+        if buf is None:
+            return None
+        if buf.dim() == 3:  # [N*H, V, K]
+            return buf[n * H + ih]
+        if buf.dim() == 4:  # [N, H, V, K]
+            return buf[n, ih]
+        raise ValueError(f"Unexpected state tensor rank: {buf.dim()}")
+
+
+    def _set_state(buf, n: int, ih: int, val_fp32: torch.Tensor):
+        if buf is None:
+            return
+        out = val_fp32.to(buf.dtype)  # cast exactly once
+        if buf.dim() == 3:
+            buf[n * H + ih].copy_(out)
+        elif buf.dim() == 4:
+            buf[n, ih].copy_(out)
+        else:
+            raise ValueError(f"Unexpected state tensor rank: {buf.dim()}")
+
+
+    # -----------------------------
+    # GQA mapping + constants
+    # -----------------------------
+    assert H % Hg == 0
+    heads_per_group = H // Hg
+    EXP_CLAMP = 80.0  # fp32 exp(80) ~ 5.5e34; avoid inf
+
+
+    for n in range(N):
+        bos, eos, Tn, NT, boh = _seq_bounds(n)
+
+        for ih in range(H):
+            hg = ih // heads_per_group
+
+            # init state
+            if USE_INITIAL_STATE:
+                init = _get_state(h0, n, ih)
+                if init is None:
+                    h_state = torch.zeros((V, K), device=device, dtype=torch.float32)
+                else:
+                    h_state = init.to(torch.float32)
+            else:
+                h_state = torch.zeros((V, K), device=device, dtype=torch.float32)
+
+            for it in range(NT):
+                # chunk bounds (sequence-local)
+                t0 = it * BT
+                t1 = min((it + 1) * BT, Tn)
+
+                abs_t0 = bos + t0
+                abs_t1 = bos + t1
+                Bt = abs_t1 - abs_t0
+                if Bt <= 0:
+                    continue
+
+                # store state before chunk
+                h[boh + it, ih].copy_(h_state.to(h.dtype))
+
+                # residual: b_v = v - w @ h
+                w_chunk = w[abs_t0:abs_t1, ih, :].to(torch.float32)  # [Bt, K]
+                v_chunk = v[abs_t0:abs_t1, ih, :].to(torch.float32)  # [Bt, V]
+                b_v = v_chunk - (w_chunk @ h_state.T)                # [Bt, V]
+
+                if SAVE_NEW_VALUE and (v_new is not None):
+                    v_new[abs_t0:abs_t1, ih, :].copy_(b_v.to(v_new.dtype))
+
+                # ---- IMPORTANT: Triton uses PER-CHUNK last index ----
+                chunk_last_idx = abs_t1 - 1
+
+                # USE_G: b_v *= exp(g_last - g_t), and h_state *= exp(g_last)
+                if USE_G:
+                    g_last = g[chunk_last_idx, ih].to(torch.float32)          # scalar
+                    g_t = g[abs_t0:abs_t1, ih].to(torch.float32)              # [Bt]
+                    b_v = b_v * torch.exp(
+                        torch.clamp(g_last - g_t, -EXP_CLAMP, EXP_CLAMP)
+                    ).unsqueeze(-1)
+                    h_state = h_state * torch.exp(torch.clamp(g_last, -EXP_CLAMP, EXP_CLAMP))
+
+                # USE_GK: h_state *= exp(gk_last) elementwise on K
+                if USE_GK:
+                    gk_last = gk[chunk_last_idx, ih, :].to(torch.float32)     # [K]
+                    h_state = h_state * torch.exp(
+                        torch.clamp(gk_last, -EXP_CLAMP, EXP_CLAMP)
+                    ).unsqueeze(0)
+
+                # update: h += b_v^T @ k_chunk
+                k_chunk = k[abs_t0:abs_t1, hg, :].to(torch.float32)           # [Bt, K]
+                h_state = h_state + (b_v.transpose(0, 1) @ k_chunk)           # [V, K]
+
+            # epilogue: Triton stores RAW accumulator
+            if STORE_FINAL_STATE:
+                _set_state(ht, n, ih, h_state)
+
+
+    return h, (v_new if SAVE_NEW_VALUE else None), (ht if STORE_FINAL_STATE else None)
 
 @torch.compiler.disable
 def chunk_gated_delta_rule(

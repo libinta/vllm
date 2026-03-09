@@ -5,7 +5,9 @@
 from collections.abc import Iterable
 from itertools import islice
 
+import os
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
@@ -105,6 +107,7 @@ logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
+_VLLM_Q35_TC_OP = os.getenv("VLLM_Q35_TC_OP", "0") == "1"
 
 def fi_chunk_gated_delta_rule(
     q: torch.Tensor,
@@ -148,6 +151,48 @@ def fi_chunk_gated_delta_rule(
     # Unsqueeze back to 4D (1, L, H, D) to match fla output format
     return output.unsqueeze(0), final_state
 
+_COMPILED_Q35_GDN_DENSE = {}
+_COMPILED_Q35_GDN_VARLEN = {}
+
+def _get_compiled_fla_cgdr_dense(*, use_qk_l2norm_in_kernel: bool):
+    key = (bool(use_qk_l2norm_in_kernel),)
+    fn = _COMPILED_Q35_GDN_DENSE.get(key)
+    if fn is not None:
+        return fn
+
+    def wrapped(q, k, v, g, beta, initial_state, output_final_state: bool):
+        return fla_chunk_gated_delta_rule(
+            q=q, k=k, v=v, g=g, beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=None,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+
+    fn = torch.compile(wrapped, fullgraph=False, dynamic=True, mode="max-autotune")
+    _COMPILED_Q35_GDN_DENSE[key] = fn
+    return fn
+
+
+def _get_compiled_fla_cgdr_varlen(*, use_qk_l2norm_in_kernel: bool):
+    key = (bool(use_qk_l2norm_in_kernel),)
+    fn = _COMPILED_Q35_GDN_VARLEN.get(key)
+    if fn is not None:
+        return fn
+
+    def wrapped(q, k, v, g, beta, initial_state, output_final_state: bool, cu_seqlens):
+        # cu_seqlens stays an input tensor
+        return fla_chunk_gated_delta_rule(
+            q=q, k=k, v=v, g=g, beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+
+    fn = torch.compile(wrapped, fullgraph=False, dynamic=True, mode="max-autotune")
+    _COMPILED_Q35_GDN_VARLEN[key] = fn
+    return fn
 
 @CustomOp.register("chunk_gated_delta_rule")
 class ChunkGatedDeltaRule(CustomOp):
@@ -197,6 +242,18 @@ class ChunkGatedDeltaRule(CustomOp):
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
     ):
+        if _VLLM_Q35_TC_OP:
+            if not hasattr(self, "_q35_tc_logged"):
+                self._q35_tc_logged = True
+                print(f"[Q35] ChunkGatedDeltaRule using torch.compile (pid={os.getpid()}, device={q.device})", flush=True)
+
+            if cu_seqlens is None:
+                compiled = _get_compiled_fla_cgdr_dense(use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel)
+                return compiled(q, k, v, g, beta, initial_state, output_final_state)
+            else:
+                compiled = _get_compiled_fla_cgdr_varlen(use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel)
+                return compiled(q, k, v, g, beta, initial_state, output_final_state, cu_seqlens)
+
         return fla_chunk_gated_delta_rule(
             q=q,
             k=k,
