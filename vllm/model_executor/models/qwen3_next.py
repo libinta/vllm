@@ -108,6 +108,14 @@ logger = init_logger(__name__)
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
+def _is_v1_profile_run() -> bool:
+    """Return True when running V1 profile/warmup without real attn metadata."""
+    try:
+        return get_forward_context().attn_metadata is None
+    except Exception:
+        return False
+
+
 def fi_chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -602,12 +610,16 @@ def local_chunk_gated_delta_rule(
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    chunk_size: int | None = None,
 ):
     """Local PyTorch chunk rule matching hpu_chunk_gated_delta_rule semantics."""
     B, T, H, Kdim = q.shape
     _, _, HV, Vdim = v.shape
     device = q.device
-    chunk_size = 64
+    if chunk_size is None:
+        chunk_size = int(os.getenv("VLLM_QWEN3NEXT_LOCAL_PREFILL_CHUNK_SIZE", "64"))
+    if chunk_size <= 0:
+        raise ValueError("'chunk_size' must be positive.")
     if cu_seqlens is not None:
         if B != 1:
             raise ValueError("When cu_seqlens is used, expected batch size B=1.")
@@ -1673,7 +1685,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
-        if core_attn_out_non_spec is not None or last_recurrent_state is not None:
+        debug_save_gdn = os.getenv("VLLM_QWEN3NEXT_DEBUG_SAVE_GDN", "0") == "1"
+        if debug_save_gdn and not _is_v1_profile_run() and (
+            core_attn_out_non_spec is not None or last_recurrent_state is not None
+        ):
             save_root = "./vllm_qwen3next_debug"
             os.makedirs(save_root, exist_ok=True)
             safe_layer_name = "".join(
@@ -1688,7 +1703,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 save_root,
                 f"{safe_layer_name}.tp{tp_rank}.step{step:06d}.pt",
             )
-
+            '''
             save_state_indices = None
             save_last_recurrent_state = last_recurrent_state
             if non_spec_state_indices_tensor is not None:
@@ -1741,8 +1756,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 },
                 out_path,
             )
-            print(f'libin debug saved recurrent state and attention output to {out_path}')
-
+            print(f"libin debug saved recurrent state and attention output to {out_path}")
+        '''
         # 3. Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
             merged_out = torch.empty(
@@ -2020,28 +2035,33 @@ class Qwen3NextDecoderLayer(nn.Module):
                     self.ffn_layer_scale.to(hidden_states.dtype) + 1
                 )
 
-        save_root = "./vllm_qwen3next_debug"
-        os.makedirs(save_root, exist_ok=True)
-        if not hasattr(self, "_debug_io_step"):
-            self._debug_io_step = 0
-        step = self._debug_io_step
-        self._debug_io_step += 1
-        tp_rank = get_tensor_model_parallel_rank()
-        out_path = os.path.join(
-            save_root,
-            f"decoder_layer_{self.layer_idx:03d}.{self.layer_type}.tp{tp_rank}.step{step:06d}.pt",
+        debug_save_decoder_io = (
+            os.getenv("VLLM_QWEN3NEXT_DEBUG_SAVE_DECODER_IO", "0") == "1"
         )
-        torch.save(
-            {
-                "layer_idx": self.layer_idx,
-                "layer_type": self.layer_type,
-                "tp_rank": tp_rank,
-                "step": step,
-                "input_hidden_states": layer_input.detach().cpu(),
-                "output_hidden_states": hidden_states.detach().cpu(),
-            },
-            out_path,
-        )
+        is_profile_run = _is_v1_profile_run()
+        if debug_save_decoder_io and not is_profile_run:
+            save_root = "./vllm_qwen3next_debug"
+            os.makedirs(save_root, exist_ok=True)
+            if not hasattr(self, "_debug_io_step"):
+                self._debug_io_step = 0
+            step = self._debug_io_step
+            self._debug_io_step += 1
+            tp_rank = get_tensor_model_parallel_rank()
+            out_path = os.path.join(
+                save_root,
+                f"decoder_layer_{self.layer_idx:03d}.{self.layer_type}.tp{tp_rank}.step{step:06d}.pt",
+            )
+            torch.save(
+                {
+                    "layer_idx": self.layer_idx,
+                    "layer_type": self.layer_type,
+                    "tp_rank": tp_rank,
+                    "step": step,
+                    "input_hidden_states": layer_input.detach().cpu(),
+                    "output_hidden_states": hidden_states.detach().cpu(),
+                },
+                out_path,
+            )
 
         return hidden_states, residual
 
