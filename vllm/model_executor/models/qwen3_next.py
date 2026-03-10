@@ -1485,6 +1485,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata,
             ).transpose(0, 1)
+
         elif attn_metadata.num_decodes > 0:
             mixed_qkv_non_spec = conv_update(
                 mixed_qkv_non_spec,
@@ -1756,7 +1757,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
-
+        #import remote_pdb; remote_pdb.set_trace()
 
 
 class Qwen3NextAttention(nn.Module):
@@ -1967,6 +1968,8 @@ class Qwen3NextDecoderLayer(nn.Module):
         positions: torch.Tensor = None,
         **kwargs: object,
     ):
+        layer_input = hidden_states
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -2016,6 +2019,29 @@ class Qwen3NextDecoderLayer(nn.Module):
                 hidden_states = hidden_states * (
                     self.ffn_layer_scale.to(hidden_states.dtype) + 1
                 )
+
+        save_root = "./vllm_qwen3next_debug"
+        os.makedirs(save_root, exist_ok=True)
+        if not hasattr(self, "_debug_io_step"):
+            self._debug_io_step = 0
+        step = self._debug_io_step
+        self._debug_io_step += 1
+        tp_rank = get_tensor_model_parallel_rank()
+        out_path = os.path.join(
+            save_root,
+            f"decoder_layer_{self.layer_idx:03d}.{self.layer_type}.tp{tp_rank}.step{step:06d}.pt",
+        )
+        torch.save(
+            {
+                "layer_idx": self.layer_idx,
+                "layer_type": self.layer_type,
+                "tp_rank": tp_rank,
+                "step": step,
+                "input_hidden_states": layer_input.detach().cpu(),
+                "output_hidden_states": hidden_states.detach().cpu(),
+            },
+            out_path,
+        )
 
         return hidden_states, residual
 
