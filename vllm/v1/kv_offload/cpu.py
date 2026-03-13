@@ -107,9 +107,10 @@ class CPUOffloadingSpec(OffloadingSpec):
         attn_backends: dict[str, type[AttentionBackend]],
     ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]:
         if not self._handlers:
-            if not current_platform.is_cuda_alike():
+            if not current_platform.is_cuda_alike() and not current_platform.is_xpu():
                 raise Exception(
-                    "CPU Offloading is currently only supported on CUDA-alike GPUs"
+                    "CPU Offloading is currently only supported on CUDA-alike "
+                    "GPUs and XPU"
                 )
 
             assert len(self.gpu_block_size) == 1

@@ -14,14 +14,16 @@ from vllm.config import KVEventsConfig, KVTransferConfig
 from vllm.distributed.kv_events import BlockStored, KVEventBatch
 from vllm.platforms import current_platform
 
-CPU_BLOCK_SIZES = [48]
+if current_platform.is_xpu():
+    CPU_BLOCK_SIZES = [64]
+else:
+    CPU_BLOCK_SIZES = [48]
 ATTN_BACKENDS = []
 
 if current_platform.is_cuda():
     ATTN_BACKENDS = ["FLASH_ATTN", "FLASHINFER", "TRITON_ATTN"]
-elif current_platform.is_rocm():
+elif current_platform.is_rocm() or current_platform.is_xpu():
     ATTN_BACKENDS = ["TRITON_ATTN"]
-
 
 class MockSubscriber:
     """Helper class to receive and verify published events"""

@@ -14,7 +14,7 @@ from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
 
 BACKENDS_TO_TEST = [FlashAttentionBackend]
 
-if not current_platform.is_rocm():
+if not current_platform.is_rocm() and not current_platform.is_xpu():
     from vllm.v1.attention.backends.flashinfer import FlashInferBackend
 
     BACKENDS_TO_TEST.append(FlashInferBackend)
@@ -33,7 +33,7 @@ NUM_HEADS = [8]
 NUM_LAYERS = [4]
 DTYPES = [torch.bfloat16]
 SEEDS = [0]
-CUDA_DEVICES = ["cuda:0"]
+CUDA_DEVICES = ["xpu:0" if current_platform.is_xpu() else "cuda:0"]
 NUM_MAPPINGS = [3]
 
 

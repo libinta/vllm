@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_offload.mediums import BlockIDsLoadStoreSpec
@@ -20,10 +23,61 @@ from vllm.v1.kv_offload.worker.worker import (
 logger = init_logger(__name__)
 
 
+def _new_accelerator_stream() -> Any:
+    """Create a new accelerator stream for the current platform."""
+    if current_platform.is_xpu():
+        return torch.xpu.Stream()
+    return torch.cuda.Stream()
+
+
+def _get_accelerator_current_stream() -> Any:
+    """Return the current accelerator stream for the current platform."""
+    if current_platform.is_xpu():
+        return torch.xpu.current_stream()
+    return torch.cuda.current_stream()
+
+
+@contextlib.contextmanager
+def _accelerator_stream(stream: Any):
+    """Context manager to run in the given accelerator stream."""
+    if current_platform.is_xpu():
+        with torch.xpu.stream(stream):
+            yield
+    else:
+        with torch.cuda.stream(stream):
+            yield
+
+
+def _swap_blocks(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    block_size_in_bytes: int,
+    block_mapping: torch.Tensor,
+) -> None:
+    """Copy specific blocks between tensors; falls back to Python on XPU."""
+    """xpu kernel implementation is availabled in vllm-xpu-kernels@v0.1.4 and later."""
+    if current_platform.is_cuda_alike():
+        ops.swap_blocks(src, dst, block_size_in_bytes, block_mapping)
+    else:
+        # Python fallback for XPU and other non-CUDA platforms.
+        element_size = src.element_size()
+        elements_per_block = block_size_in_bytes // element_size
+        src_flat = src.view(-1)
+        dst_flat = dst.view(-1)
+        for i in range(block_mapping.size(0)):
+            src_block = block_mapping[i, 0].item()
+            dst_block = block_mapping[i, 1].item()
+            src_start = src_block * elements_per_block
+            dst_start = dst_block * elements_per_block
+            dst_flat[dst_start : dst_start + elements_per_block].copy_(
+                src_flat[src_start : src_start + elements_per_block]
+            )
+
+
 @dataclass
 class Transfer:
     job_id: int
-    stream: torch.cuda.Stream
+    stream: Any
     start_event: torch.Event
     end_event: torch.Event
     num_bytes: int
@@ -67,7 +121,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
     SingleDirectionOffloadingHandler handles transfers for a single direction,
     either CPU->GPU or GPU->CPU.
     Transfers are guaranteed to be executed in order of their submission.
-    Each transfer uses a unique CUDA stream, and its stream will start
+    Each transfer uses a unique accelerator stream, and its stream will start
     executing only after the streams of previous transfers have finished.
     """
 
@@ -105,15 +159,17 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self.total_block_size_in_bytes = sum(self.block_size_in_bytes)
 
         assert len(src_tensors) > 0
-        self.gpu_to_cpu: bool = self.src_tensors[0].is_cuda
+        self.gpu_to_cpu: bool = (
+            self.src_tensors[0].is_cuda or self.src_tensors[0].is_xpu
+        )
         self.transfer_type = ("GPU", "CPU") if self.gpu_to_cpu else ("CPU", "GPU")
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
         # queue of transfers (job_id, stream, event)
         self._transfers: deque[Transfer] = deque()
-        # list of CUDA streams available for re-use
-        self._stream_pool: list[torch.cuda.Stream] = []
-        # list of CUDA events available for re-use
+        # list of accelerator streams available for re-use
+        self._stream_pool: list[Any] = []
+        # list of accelerator events available for re-use
         self._event_pool: list[torch.Event] = []
 
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
@@ -142,7 +198,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         expand_block_ids(dst_blocks, self.dst_block_size_factor, src_to_dst[:, 1])
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
-        stream = self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
+        stream = (
+            self._stream_pool.pop() if self._stream_pool else _new_accelerator_stream()
+        )
         start_event = (
             self._event_pool.pop()
             if self._event_pool
@@ -156,20 +214,20 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
         if self.gpu_to_cpu:
             # wait for model computation to finish before offloading
-            stream.wait_stream(torch.cuda.current_stream())
+            stream.wait_stream(_get_accelerator_current_stream())
         if self._transfers:
             last_transfer: Transfer = self._transfers[-1]
             last_event = last_transfer.end_event
             # assure job will start only after the previous one completes
             stream.wait_event(last_event)
-        with torch.cuda.stream(stream):
+        with _accelerator_stream(stream):
             start_event.record(stream)
             for src_tensor, dst_tensor, block_size_in_bytes in zip(
                 self.src_tensors,
                 self.dst_tensors,
                 self.block_size_in_bytes,
             ):
-                ops.swap_blocks(
+                _swap_blocks(
                     src_tensor,
                     dst_tensor,
                     block_size_in_bytes,
