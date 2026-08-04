@@ -375,7 +375,17 @@ class SingleDirectionOffloadingHandler:
 
         if self.gpu_to_cpu:
             # wait for model computation to finish before offloading
-            stream.wait_stream(current_platform.current_stream())
+            if current_platform.is_xpu():
+                # On XPU device-side inter-stream waits are not honored across
+                # the transfer/compute stream boundary, so the store copy may
+                # read live KV before compute finishes writing it. Block on a
+                # compute-completion event (not a full device sync) to enforce
+                # the ordering.
+                compute_done = torch.Event()
+                compute_done.record(current_platform.current_stream())
+                compute_done.synchronize()
+            else:
+                stream.wait_stream(current_platform.current_stream())
         if self._transfers:
             last_transfer: Transfer = self._transfers[-1]
             last_event = last_transfer.end_event
