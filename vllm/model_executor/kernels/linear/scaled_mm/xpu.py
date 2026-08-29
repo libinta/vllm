@@ -272,13 +272,15 @@ class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         Bs: torch.Tensor,
     ) -> torch.Tensor:
         # B is [N, K]; .t() gives [K, N] view (no copy).
-        # Bs is stored as [n_blocks, k_blocks] view; .t() recovers the
-        # contiguous [k_blocks, n_blocks] buffer that oneDNN expects.
+        # Bs is stored as an [n_blocks, k_blocks] transpose view; .t() gives the
+        # [k_blocks, n_blocks] layout oneDNN expects, but that view is not
+        # guaranteed contiguous, so materialize it: fp8_gemm requires a
+        # contiguous B_scale. This is a no-op when the view is already contiguous.
         return torch.ops._xpu_C.fp8_gemm(
             A,
             B.t(),
             self.config.out_dtype,
             As,
-            Bs.t(),
+            Bs.t().contiguous(),
             torch.Tensor(),
         )
