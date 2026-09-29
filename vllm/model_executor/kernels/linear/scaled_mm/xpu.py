@@ -272,13 +272,18 @@ class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         Bs: torch.Tensor,
     ) -> torch.Tensor:
         # B is [N, K]; .t() gives [K, N] view (no copy).
-        # Bs is stored as [n_blocks, k_blocks] view; .t() recovers the
-        # contiguous [k_blocks, n_blocks] buffer that oneDNN expects.
+        # Bs is stored as [n_blocks, k_blocks]; oneDNN wants a contiguous
+        # [k_blocks, n_blocks] buffer. The UVA weight offloader re-materializes
+        # scales as plain contiguous tensors, so Bs.t() is non-contiguous here
+        # (the transposed-view trick doesn't survive offload) -> force contig.
+        b_scale = Bs.t()
+        if not b_scale.is_contiguous():
+            b_scale = b_scale.contiguous()
         return torch.ops._xpu_C.fp8_gemm(
             A,
             B.t(),
             self.config.out_dtype,
             As,
-            Bs.t(),
+            b_scale,
             torch.Tensor(),
         )
